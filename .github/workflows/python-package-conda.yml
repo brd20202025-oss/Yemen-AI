@@ -1,34 +1,90 @@
-name: Python Package using Conda
+name: Build Smart AI Android APK
 
-on: [push]
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 5
+  build:
+    runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
       with:
-        python-version: '3.10'
-    - name: Add conda to system path
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Install system dependencies
       run: |
-        # $CONDA is an environment variable pointing to the root of the miniconda directory
-        echo $CONDA/bin >> $GITHUB_PATH
-    - name: Install dependencies
+        sudo apt-get update
+        sudo apt-get install -y python3-pip python3-venv build-essential git zip unzip
+
+    - name: Install Python deps and Buildozer
       run: |
-        conda env update --file environment.yml --name base
-    - name: Lint with flake8
+        pip install --upgrade pip
+        pip install Cython==0.30.10
+        pip install buildozer
+
+    - name: Install Android command line tools
+      env:
+        ANDROID_SDK_ROOT: ${{ runner.workspace }}/android-sdk
       run: |
-        conda install flake8
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Test with pytest
+        mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+        curl -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+        unzip -q cmdline-tools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
+        # move to expected path
+        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_SDK_ROOT --licenses
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools" "platforms;android-31" "build-tools;31.0.0" "ndk;21.4.7075529"
+
+    - name: Set Android env vars
       run: |
-        conda install pytest
-        pytest
+        echo "ANDROID_SDK_ROOT=${{ runner.workspace }}/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_NDK_HOME=${{ runner.workspace }}/android-sdk/ndk/21.4.7075529" >> $GITHUB_ENV
+
+    - name: Restore keystore from secret
+      env:
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      run: |
+        if [ -n "$KEYSTORE_BASE64" ]; then
+          echo "$KEYSTORE_BASE64" | base64 --decode > myreleasekey.keystore
+        fi
+
+    - name: Build with Buildozer (release)
+      run: |
+        # adjust if your spec expects a specific key name/location
+        buildozer -v android release
+
+    - name: Sign and align APK (if needed)
+      env:
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      run: |
+        # find the unsigned APK (اسم الملف قد يختلف حسب buildozer)
+        unsigned=$(ls bin/*release-unsigned.apk || true)
+        if [ -n "$unsigned" ]; then
+          # path to apksigner and zipalign (من build-tools)
+          build_tools="$(ls -d $ANDROID_SDK_ROOT/build-tools/* | sort -V | tail -n1)"
+          zipalign="$build_tools/zipalign"
+          apksigner="$build_tools/apksigner"
+          aligned="bin/app-release-aligned.apk"
+          signed="bin/app-release-signed.apk"
+          $zipalign -v 4 "$unsigned" "$aligned"
+          $apksigner sign --ks myreleasekey.keystore --ks-pass pass:$KEYSTORE_PASSWORD --key-pass pass:$KEY_PASSWORD --out "$signed" "$aligned"
+          $apksigner verify "$signed"
+        else
+          echo "No unsigned release APK found; check buildozer output."
+          exit 1
+        fi
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SmartAI-release-APK
+        path: bin/*.apk
